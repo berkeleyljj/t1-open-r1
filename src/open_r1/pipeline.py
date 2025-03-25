@@ -9,18 +9,12 @@ prompt_template= """\
 You are a software engineer, and you will be given a problem. Based on the problem you will write four proposals, 
 but only one proposal is the correct solution. 
 
-Please reason step by step, and put your final answer within \boxed{}:
-{{ instruction }}
-
-Write four proposals with the following guideline, for each proposal:
-- A summary of your intended solution
-- Any trade-offs or dependencies involved
-- Tools, libraries, or files to modify
-
-Your first proposal should be the best solution.
-The other three proposals should be best-effort, but does not entirely resolve the issue. 
-
-Write clearly and concisely.
+Write four proposals with the following guideline:
+- A concise discussion-style summary of your solution
+- A very brief explanation of dependencies
+- One proposal should be the best solution.
+- The other three proposals should be best-effort, but does not entirely resolve the issue. 
+- Reason step by step, and put your final answer within \boxed{}: {{ instruction }}
 """
 
 dataset = load_dataset("AI-MO/NuminaMath-TIR", split="train").select(range(10))
