@@ -1,534 +1,342 @@
-"""Reward functions for GRPO training."""
-
-import asyncio
-import json
-import math
+# Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
+# This is the rewards.py file used in SWE-RL
+import difflib
 import re
-from functools import partial, update_wrapper
-from typing import Callable, Dict
+import warnings
+from typing import TypedDict
 
-from latex2sympy2_extended import NormalizationConfig
-from math_verify import LatexExtractionConfig, parse, verify
+from unidiff import PatchedFile, PatchSet
+from unidiff.errors import UnidiffParseError
 
-from .utils import is_e2b_available
-from .utils.ioi import SubtaskResult, add_includes, get_piston_client_from_env, score_subtask
+THINK_START = "<think>"
+THINK_END = "</think>"
+ANSWER_START = "<solution>"
+ANSWER_END = "</solution>"
 
-
-if is_e2b_available():
-    from dotenv import load_dotenv
-    from e2b_code_interpreter import AsyncSandbox
-
-    load_dotenv()
-else:
-    AsyncSandbox = None
+SEARCH_REPLACE_REGEX = r"```.*?\n### (.*)\n<<<<<<< SEARCH\n([\s\S]*?)\n=======\n([\s\S]*?)\n>>>>>>> REPLACE\n```"
 
 
-def accuracy_reward(completions, solution, **kwargs):
-    """Reward function that checks if the completion is the same as the ground truth."""
-    contents = [completion[0]["content"] for completion in completions]
-    rewards = []
-    for content, sol in zip(contents, solution):
-        gold_parsed = parse(
-            sol,
-            extraction_mode="first_match",
-            extraction_config=[LatexExtractionConfig()],
-        )
-        if len(gold_parsed) != 0:
-            # We require the answer to be provided in correct latex (no malformed operators)
-            answer_parsed = parse(
-                content,
-                extraction_config=[
-                    LatexExtractionConfig(
-                        normalization_config=NormalizationConfig(
-                            nits=False,
-                            malformed_operators=False,
-                            basic_latex=True,
-                            equations=True,
-                            boxed="all",
-                            units=True,
-                        ),
-                        # Ensures that boxed is tried first
-                        boxed_match_priority=0,
-                        try_extract_without_anchor=False,
-                    )
-                ],
-                extraction_mode="first_match",
-            )
-            # Reward 1 if the content is the same as the ground truth, 0 otherwise
-            try:
-                reward = float(verify(answer_parsed, gold_parsed))
-            except Exception as e:
-                print(f"verify failed: {e}, answer: {answer_parsed}, gold: {gold_parsed}")
-                reward = 0.0
-        else:
-            # If the gold solution is not parseable, we reward 1 to skip this example
-            reward = 1.0
-            print("Failed to parse gold solution: ", sol)
-        rewards.append(reward)
-
-    return rewards
+class FormatError(Exception):
+    pass
 
 
-def format_reward(completions, **kwargs):
-    """Reward function that checks if the reasoning process is enclosed within <think> and </think> tags, while the final answer is enclosed within <answer> and </answer> tags."""
-    pattern = r"^<think>\n.*?\n</think>\n<answer>\n.*?\n</answer>$"
-    completion_contents = [completion[0]["content"] for completion in completions]
-    matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE) for content in completion_contents]
-    return [1.0 if match else 0.0 for match in matches]
-
-
-def tag_count_reward(completions, **kwargs) -> list[float]:
-    """Reward function that checks if we produce the desired number of think and answer tags associated with `format_reward()`.
-
-    Adapted from: https://gist.github.com/willccbb/4676755236bb08cab5f4e54a0475d6fb#file-grpo_demo-py-L90
+def extract_thought_solution(output: str) -> tuple[str, str]:
     """
-
-    def count_tags(text: str) -> float:
-        count = 0.0
-        if text.count("<think>\n") == 1:
-            count += 0.25
-        if text.count("\n</think>\n") == 1:
-            count += 0.25
-        if text.count("\n<answer>\n") == 1:
-            count += 0.25
-        if text.count("\n</answer>") == 1:
-            count += 0.25
-        return count
-
-    contents = [completion[0]["content"] for completion in completions]
-    return [count_tags(c) for c in contents]
-
-
-def reasoning_steps_reward(completions, **kwargs):
-    r"""Reward function that checks for clear step-by-step reasoning.
-    Regex pattern:
-        Step \d+: - matches "Step 1:", "Step 2:", etc.
-        ^\d+\. - matches numbered lists like "1.", "2.", etc. at start of line
-        \n- - matches bullet points with hyphens
-        \n\* - matches bullet points with asterisks
-        First,|Second,|Next,|Finally, - matches transition words
+    Extract the thought and solution from the output. It is expected to have the following format:
+    <think>
+    ...
+    </think>
+    <solution>
+    ...
+    </solution>
     """
-    pattern = r"(Step \d+:|^\d+\.|\n-|\n\*|First,|Second,|Next,|Finally,)"
-    completion_contents = [completion[0]["content"] for completion in completions]
-    matches = [len(re.findall(pattern, content)) for content in completion_contents]
+    for tag in [THINK_START, THINK_END, ANSWER_START, ANSWER_END]:
+        if output.count(tag) != 1:
+            raise FormatError(f"count of {tag} is not 1")
 
-    # Magic number 3 to encourage 3 steps and more, otherwise partial reward
-    return [min(1.0, count / 3) for count in matches]
+    thought = output.split(THINK_START)[1].split(THINK_END)[0].strip()
+    answer = output.split(ANSWER_START)[1].split(ANSWER_END)[0].strip()
+    if len(thought) == 0:
+        raise FormatError("Thought is empty")
+    return thought, answer
 
 
-def len_reward(completions: list[Dict[str, str]], solution: list[str], **kwargs) -> float:
-    """Compute length-based rewards to discourage overthinking and promote token efficiency.
-
-    Taken from the Kimi 1.5 tech report: https://arxiv.org/abs/2501.12599
-
-    Args:
-        completions: List of model completions
-        solution: List of ground truth solutions
+def parse_search_replace(text: str) -> dict[str, list[tuple[str, str]]]:
+    """
+    Parse the search/replace blocks from the text.
 
     Returns:
-        List of rewards where:
-        - For correct answers: reward = 0.5 - (len - min_len)/(max_len - min_len)
-        - For incorrect answers: reward = min(0, 0.5 - (len - min_len)/(max_len - min_len))
+        A dictionary where the key is the file path and the value is a list of search/replace pairs.
     """
-    contents = [completion[0]["content"] for completion in completions]
+    path_search_replaces: list[tuple[str, str, str]] = re.findall(
+        SEARCH_REPLACE_REGEX, text
+    )
+    path_search_replace_dict = dict[str, list[tuple[str, str]]]()
+    for path, search, replace in path_search_replaces:
+        path_search_replace_dict.setdefault(path, []).append((search, replace))
+    return path_search_replace_dict
 
-    # First check correctness of answers
-    correctness = []
-    for content, sol in zip(contents, solution):
-        gold_parsed = parse(
-            sol,
-            extraction_mode="first_match",
-            extraction_config=[LatexExtractionConfig()],
-        )
-        if len(gold_parsed) == 0:
-            # Skip unparseable examples
-            correctness.append(True)  # Treat as correct to avoid penalizing
-            print("Failed to parse gold solution: ", sol)
-            continue
 
-        answer_parsed = parse(
-            content,
-            extraction_config=[
-                LatexExtractionConfig(
-                    normalization_config=NormalizationConfig(
-                        nits=False,
-                        malformed_operators=False,
-                        basic_latex=True,
-                        equations=True,
-                        boxed=True,
-                        units=True,
-                    ),
-                    boxed_match_priority=0,
-                    try_extract_without_anchor=False,
-                )
-            ],
-            extraction_mode="first_match",
-        )
-        correctness.append(verify(answer_parsed, gold_parsed))
+def generate_unified_diff(
+    old_code: str,
+    new_code: str,
+    n_context: int = 3,
+) -> str:
+    """Generate a unified diff between two code.
 
-    # Calculate lengths
-    lengths = [len(content) for content in contents]
-    min_len = min(lengths)
-    max_len = max(lengths)
+    Args:
+        old_code: The original code.
+        new_code: The modified code.
+        n_context: The number of context lines to show.
 
-    # If all responses have the same length, return zero rewards
-    if max_len == min_len:
-        return [0.0] * len(completions)
+    Returns:
+        A string representing the unified diff."""
 
-    rewards = []
-    for length, is_correct in zip(lengths, correctness):
-        lambda_val = 0.5 - (length - min_len) / (max_len - min_len)
+    original_lines = old_code.splitlines()
+    modified_lines = new_code.splitlines()
 
-        if is_correct:
-            reward = lambda_val
+    diff = difflib.unified_diff(
+        original_lines,
+        modified_lines,
+        fromfile="old",
+        tofile="new",
+        lineterm="",
+        n=n_context,
+    )
+    try:
+        next(diff)
+        next(diff)
+        diff_code = "\n".join(diff)
+        return diff_code
+    except StopIteration:
+        return ""
+
+
+def apply_code_change(
+    code_context: dict[str, str],
+    search_replace_dict: dict[str, list[tuple[str, str]]],
+    silent: bool = False,
+) -> dict[str, str]:
+    """
+    Apply the search/replace edits to the code context.
+
+    Args:
+        code_context: A dictionary containing the file path and the content of the code.
+        search_replace_dict: A dictionary mapping the file path to the search/replace edits.
+        silent: Whether to suppress the error messages.
+
+    Returns:
+        A dictionary containing the file path and the new content of the code.
+    """
+    new_content_dict = dict[str, str]()
+    for path, search_replaces in search_replace_dict.items():
+        new_content = "\n" + code_context.get(path, "")
+        for search, replace in search_replaces:
+            # Ensure search block can be matched
+            # "\n" + search to ensure the indentations are correct
+            if not silent and len(search) == len(replace) and search == replace:
+                raise FormatError("Search and replace blocks are identical")
+            search = "\n" + search
+            replace = "\n" + replace
+            if not silent and search not in new_content:
+                raise FormatError(f"Search block not found in the code: {search}")
+            new_content = new_content.replace(search, replace)
+        # Remove the leading "\n"
+        new_content_dict[path] = new_content[1:]
+    return new_content_dict
+
+
+def get_normalized_patch(
+    code_context: dict[str, str],
+    new_content_dict: dict[str, str],
+) -> dict[str, str]:
+    """
+    According to the code context and new content, generate the normalized patch for each file.
+
+    Args:
+        code_context: A dictionary containing the file path and the content of the code.
+        new_content_dict: A dictionary mapping the file path to the new content of the file.
+
+    Returns:
+        A dictionary containing the file path and the normalized patch.
+    """
+    patch_dict = dict[str, str]()
+    for path, new_content in new_content_dict.items():
+        old_content = code_context.get(path, "")
+        patch = generate_unified_diff(old_content, new_content)
+        # Only add the patch if it's not empty
+        # NOTE: this should not happen due to the search == replace check in `apply_code_change`
+        # but it can occur in general-purpose usages
+        if patch:
+            patch_dict[path] = patch
+    return patch_dict
+
+
+class ChangeSimilarity(TypedDict):
+    path: str
+    pred_change: str
+    oracle_change: str
+    similarity: float
+
+
+def compute_change_similarities(
+    pred_patch: dict[str, str],
+    oracle_patch: dict[str, str],
+) -> list[ChangeSimilarity]:
+    all_file_paths = set(oracle_patch.keys()).union(set(pred_patch.keys()))
+    similarities = list[ChangeSimilarity]()
+    for path in all_file_paths:
+        pred_change = pred_patch.get(path, "")
+        oracle_change = oracle_patch.get(path, "")
+        if oracle_change == "" or pred_change == "":
+            # Both are empty changes, meaning search = replace. We should penalize this to avoid
+            # the model predicting empty changes to hack the reward.
+            # NOTE: this should not happen due to (1) the search == replace check in `apply_code_change`
+            # and (2) the `if patch` check in `get_normalized_patch`.
+            change_similarity = 0.0
         else:
-            reward = min(0, lambda_val)
-
-        rewards.append(float(reward))
-
-    return rewards
-
-
-def get_cosine_scaled_reward(
-    min_value_wrong: float = -1.0,
-    max_value_wrong: float = -0.5,
-    min_value_correct: float = 0.5,
-    max_value_correct: float = 1.0,
-    max_len: int = 1000,
-):
-    def cosine_scaled_reward(completions, solution, **kwargs):
-        """Reward function that scales based on completion length using a cosine schedule.
-
-        Shorter correct solutions are rewarded more than longer ones.
-        Longer incorrect solutions are penalized less than shorter ones.
-
-        Args:
-            completions: List of model completions
-            solution: List of ground truth solutions
-
-        This function is parameterized by the following arguments:
-            min_value_wrong: Minimum reward for wrong answers
-            max_value_wrong: Maximum reward for wrong answers
-            min_value_correct: Minimum reward for correct answers
-            max_value_correct: Maximum reward for correct answers
-            max_len: Maximum length for scaling
-        """
-        contents = [completion[0]["content"] for completion in completions]
-        rewards = []
-
-        for content, sol in zip(contents, solution):
-            gold_parsed = parse(sol, extraction_mode="first_match", extraction_config=[LatexExtractionConfig()])
-            if len(gold_parsed) == 0:
-                rewards.append(1.0)  # Skip unparseable examples
-                print("Failed to parse gold solution: ", sol)
-                continue
-
-            answer_parsed = parse(
-                content,
-                extraction_config=[
-                    LatexExtractionConfig(
-                        normalization_config=NormalizationConfig(
-                            nits=False,
-                            malformed_operators=False,
-                            basic_latex=True,
-                            equations=True,
-                            boxed=True,
-                            units=True,
-                        ),
-                        boxed_match_priority=0,
-                        try_extract_without_anchor=False,
-                    )
-                ],
-                extraction_mode="first_match",
+            change_similarity = difflib.SequenceMatcher(
+                None,
+                pred_change,
+                oracle_change,
+                autojunk=False,
+            ).ratio()
+        similarities.append(
+            ChangeSimilarity(
+                path=path,
+                pred_change=pred_change,
+                oracle_change=oracle_change,
+                similarity=change_similarity,
             )
-
-            is_correct = verify(answer_parsed, gold_parsed)
-            gen_len = len(content)
-
-            # Apply cosine scaling based on length
-            progress = gen_len / max_len
-            cosine = math.cos(progress * math.pi)
-
-            if is_correct:
-                min_value = min_value_correct
-                max_value = max_value_correct
-            else:
-                # Swap min/max for incorrect answers
-                min_value = max_value_wrong
-                max_value = min_value_wrong
-
-            reward = min_value + 0.5 * (max_value - min_value) * (1.0 + cosine)
-            rewards.append(float(reward))
-
-        return rewards
-
-    return cosine_scaled_reward
+        )
+    return similarities
 
 
-def get_repetition_penalty_reward(ngram_size: int, max_penalty: float):
+def calculate_reward(
+    code_context: dict[str, str],
+    oracle_new_content: dict[str, str],
+    pred_new_content: dict[str, str],
+) -> tuple[float, dict]:
     """
-    Computes N-gram repetition penalty as described in Appendix C.2 of https://arxiv.org/abs/2502.03373.
-    Reference implementation from: https://github.com/eddycmu/demystify-long-cot/blob/release/openrlhf/openrlhf/reward/repetition.py
+    Compute the SWE-RL reward given the code context, oracle patch, and the model output.
+    Note that this function is a general version of the reward calculation, which can be used
+    for code changes in any form, not just search/replace edits. For search/replace edits, use
+    `calculate_search_replace_reward`.
+
+    The return value is always within the range of [0, 1].
 
     Args:
-    ngram_size: size of the n-grams
-    max_penalty: Maximum (negative) penalty for wrong answers
+        code_context: path -> original content of the file. It doesn't need to
+            contain the entire codebase, only the files that are affected by the oracle patch.
+        oracle_new_content: path -> oracle new content of the file after change.
+        pred_new_content: path -> predicted new content of the file after change.
+
+    Returns:
+        A float value representing the reward, and a dictionary containing some metadata.
     """
-    if max_penalty > 0:
-        raise ValueError(f"max_penalty {max_penalty} should not be positive")
-
-    def zipngram(text: str, ngram_size: int):
-        words = text.lower().split()
-        return zip(*[words[i:] for i in range(ngram_size)])
-
-    def repetition_penalty_reward(completions, **kwargs) -> float:
-        """
-        reward function the penalizes repetitions
-        ref implementation: https://github.com/eddycmu/demystify-long-cot/blob/release/openrlhf/openrlhf/reward/repetition.py
-
-        Args:
-            completions: List of model completions
-        """
-
-        contents = [completion[0]["content"] for completion in completions]
-        rewards = []
-        for completion in contents:
-            if completion == "":
-                rewards.append(0.0)
-                continue
-            if len(completion.split()) < ngram_size:
-                rewards.append(0.0)
-                continue
-
-            ngrams = set()
-            total = 0
-            for ng in zipngram(completion, ngram_size):
-                ngrams.add(ng)
-                total += 1
-
-            scaling = 1 - len(ngrams) / total
-            reward = scaling * max_penalty
-            rewards.append(reward)
-        return rewards
-
-    return repetition_penalty_reward
+    # Obtain a unified diff for each file, for both the predicted and the oracle patch
+    oracle_patch = get_normalized_patch(code_context, oracle_new_content)
+    pred_patch = get_normalized_patch(code_context, pred_new_content)
+    # Calculate the reward based on the similarity between the predicted and the oracle patch
+    similarities = compute_change_similarities(pred_patch, oracle_patch)
+    # assert len(similarities) > 0
+    # This means oracle_patch and pred_patch are both empty, then they are identical and we reward 1.0
+    if len(similarities) == 0:
+        assert len(oracle_patch) == 0 and len(pred_patch) == 0
+        return 1.0, dict(similarities=[])
+    reward = sum(map(lambda x: x["similarity"], similarities)) / len(similarities)
+    return reward, dict(similarities=similarities)
 
 
-def _init_event_loop():
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    return loop
-
-
-def ioi_code_reward(completions, test_batch_size: int = 1, **kwargs) -> list[float]:
-    """Reward function that evaluates IOI problems using Piston+our IOI package.
-
-    Assumes the dataset has the same format as hf.co/datasets/open-r1/ioi
-
-    test_batch_size: evaluate these many test cases in parallel, then check if any of them failed (0 score): if so stop evaluating; otherwise continue with the next batch of test cases.
+def calculate_search_replace_reward(
+    code_context: dict[str, str],
+    oracle_new_content: dict[str, str],
+    output: str,
+) -> tuple[float, dict]:
     """
-    # for info on setting up piston workers, see slurm/piston/README.md
-    piston_client = get_piston_client_from_env()
-
-    code_snippets = [
-        # note: grading is automatically skipped if no code is extracted
-        add_includes(extract_code(completion[-1]["content"], "cpp"), problem_id)
-        for completion, problem_id in zip(completions, kwargs["id"])
-    ]
-
-    async def run_catch_exceptions(task):
-        try:
-            return await task
-        except Exception as e:
-            print(f"Error from Piston worker: {e}")
-            return SubtaskResult()  # score 0.0
-
-    # load problem data. undo separating kwargs by column
-    problems_data = [dict(zip(kwargs.keys(), values)) for values in zip(*kwargs.values())]
-
-    loop = _init_event_loop()
-    evals = [
-        loop.create_task(
-            run_catch_exceptions(score_subtask(piston_client, problem_data, code, test_batch_size=test_batch_size))
-        )
-        for problem_data, code in zip(problems_data, code_snippets)
-    ]
-    results = loop.run_until_complete(asyncio.gather(*evals))
-
-    return [result.score for result in results]
-
-
-def extract_code(completion: str, language: str = "python") -> str:
-    pattern = re.compile(rf"```{language}\n(.*?)```", re.DOTALL)
-    matches = pattern.findall(completion)
-    extracted_answer = matches[-1] if len(matches) >= 1 else ""
-    return extracted_answer
-
-
-def binary_code_reward(completions, **kwargs) -> list[float]:
-    rewards = code_reward(completions, **kwargs)
-    BINARY_THRESHOLD = 0.99
-    return [1.0 if reward > BINARY_THRESHOLD else 0.0 for reward in rewards]
-
-
-def code_reward(completions, **kwargs) -> list[float]:
-    """Reward function that evaluates code snippets using the E2B code interpreter.
-
-    Assumes the dataset contains a `verification_info` column with test cases.
-    """
-    if not is_e2b_available():
-        raise ImportError(
-            "E2B is not available and required for this reward function. Please install E2B with "
-            "`pip install e2b-code-interpreter` and add an API key to a `.env` file."
-        )
-
-    # TODO: add support for other languages in E2B: https://e2b.dev/docs/code-interpreting/supported-languages
-    """Returns a reward function that evaluates code snippets in a sandbox."""
-    evaluation_script_template = """
-    import subprocess
-    import json
-
-    def evaluate_code(code, test_cases):
-        passed = 0
-        total = len(test_cases)
-        exec_timeout = 5
-
-        for case in test_cases:
-            process = subprocess.run(
-                ["python3", "-c", code],
-                input=case["input"],
-                text=True,
-                capture_output=True,
-                timeout=exec_timeout
-            )
-
-            if process.returncode != 0:  # Error in execution
-                continue
-
-            output = process.stdout.strip()
-
-            # TODO: implement a proper validator to compare against ground truth. For now we just check for exact string match on each line of stdout.
-            all_correct = True
-            for line1, line2 in zip(output.split('\\n'), case['output'].split('\\n')):
-                all_correct = all_correct and line1.strip() == line2.strip()
-
-            if all_correct:
-                passed += 1
-
-        success_rate = (passed / total)
-        return success_rate
-
-    code_snippet = {code}
-    test_cases = json.loads({test_cases})
-
-    evaluate_code(code_snippet, test_cases)
-    """
-    code_snippets = [extract_code(completion[-1]["content"]) for completion in completions]
-    verification_info = kwargs["verification_info"]
-    scripts = [
-        evaluation_script_template.format(code=json.dumps(code), test_cases=json.dumps(json.dumps(info["test_cases"])))
-        for code, info in zip(code_snippets, verification_info)
-    ]
-
-    language = verification_info[0]["language"]
-
-    if not all(v["language"] == language for v in verification_info):
-        raise ValueError("All verification_info must have the same language", verification_info)
-    try:
-        rewards = run_async_from_sync(scripts, language)
-
-    except Exception as e:
-        print(f"Error from E2B executor: {e}")
-        rewards = [0.0] * len(completions)
-
-    return rewards
-
-
-def get_code_format_reward(language: str = "python"):
-    """Format reward function specifically for code responses.
+    The search/replace version of the reward calculation. It expects the output to contain
+    the thought and solution in the following format:
+    <think>
+    ...
+    </think>
+    <solution>
+    ...
+    </solution>
 
     Args:
-        language: Programming language supported by E2B https://e2b.dev/docs/code-interpreting/supported-languages
+        code_context: path -> original content of the file.
+        oracle_new_content: path -> oracle new content of the file after change.
+        output: The output from the model containing the thought and solution.
+
+    Returns:
+        A float value representing the reward, and a dictionary containing some metadata.
     """
-    pattern = rf"^<think>\n.*?\n</think>\n<answer>\n.*?```{language}.*?```.*?\n</answer>$"
-
-    def code_format_reward(completions, **kwargs):
-        completion_contents = [completion[0]["content"] for completion in completions]
-        matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE) for content in completion_contents]
-        return [1.0 if match else 0.0 for match in matches]
-
-    return code_format_reward
-
-
-def run_async_from_sync(scripts: list[str], language: str) -> list[float]:
-    """Function wrapping the `run_async` function."""
-    # Create a new event loop and set it
     try:
-        # Run the async function and get the result
-        rewards = asyncio.run(run_async(scripts, language))
-    except Exception as e:
-        print(f"Error from E2B executor async: {e}")
-        raise e
-
-    return rewards
-
-
-async def run_async(scripts: list[str], language: str) -> list[float]:
-    # Create the sandbox by hand, currently there's no context manager for this version
-    sbx = await AsyncSandbox.create(timeout=30, request_timeout=3)
-
-    # Create a list of tasks for running scripts concurrently
-    tasks = [run_script(sbx, script, language) for script in scripts]
-
-    # Wait for all tasks to complete and gather their results as they finish
-    results = await asyncio.gather(*tasks)
-    rewards = list(results)  # collect results
-
-    # Kill the sandbox after all the tasks are complete
-    await sbx.kill()
-
-    return rewards
+        # Extract the thought and solution from the output
+        thought, answer = extract_thought_solution(output)
+        # Parse the search/replace edits from the solution
+        pred_search_replaces = parse_search_replace(answer)
+        if len(pred_search_replaces) == 0:
+            raise FormatError("No valid search blocks found")
+        # Get the new content of each file after applying the search/replace edits
+        pred_new_content = apply_code_change(code_context, pred_search_replaces)
+        reward, metadata = calculate_reward(
+            code_context, oracle_new_content, pred_new_content
+        )
+        metadata["thought"] = thought
+        metadata["answer"] = answer
+        return reward, metadata
+    except FormatError as e:
+        return -1.0, dict(error=str(e))
 
 
-async def run_script(sbx: AsyncSandbox, script: str, language: str) -> float:
-    execution = await sbx.run_code(script, language=language)
+def get_filelevel_diff(patch_text: str) -> dict[str, str]:
+    """
+    Convert a unified diff text into a dictionary of file patches.
+    """
     try:
-        return float(execution.text)
-    except (TypeError, ValueError):
-        return 0.0
+        patch = PatchSet(patch_text)
+    except UnidiffParseError:
+        return {}
     except Exception as e:
-        print(f"Error from E2B executor run_script: {e}")
-        return 0.0
+        # NOTE: sometimes unidiff throws other exceptions (e.g. UnboundLocalError) than
+        # UnidiffParseError, which is unexpected, but we should still handle it.
+        warnings.warn(f"Unexpected unidiff parsing error: {str(e)}")
+        return {}
+    result = dict[str, str]()
+    for patchfile in patch:
+        patchfile: PatchedFile = patchfile
+        if patchfile.is_binary_file:
+            # We don't consider binary files
+            continue
+        if patchfile.is_rename:
+            # Add a special header for renamed files
+            source_file = patchfile.source_file
+            target_file = patchfile.target_file
+            if source_file.startswith("a/"):
+                source_file = source_file[2:]
+            if target_file.startswith("b/"):
+                target_file = target_file[2:]
+            header = f"rename from {source_file} to {target_file}"
+            path = source_file
+        else:
+            header = ""
+            path = patchfile.path
+        body = "\n".join(str(hunk).strip() for hunk in patchfile)
+        content = header + "\n" + body
+        content = content.strip()
+        result[path] = content
+    return result
 
 
-def get_reward_funcs(script_args) -> list[Callable]:
-    REWARD_FUNCS_REGISTRY = {
-        "accuracy": accuracy_reward,
-        "format": format_reward,
-        "reasoning_steps": reasoning_steps_reward,
-        "cosine": get_cosine_scaled_reward(
-            min_value_wrong=script_args.cosine_min_value_wrong,
-            max_value_wrong=script_args.cosine_max_value_wrong,
-            min_value_correct=script_args.cosine_min_value_correct,
-            max_value_correct=script_args.cosine_max_value_correct,
-            max_len=script_args.cosine_max_len,
-        ),
-        "repetition_penalty": get_repetition_penalty_reward(
-            ngram_size=script_args.repetition_n_grams,
-            max_penalty=script_args.repetition_max_penalty,
-        ),
-        "length": len_reward,
-        "code": code_reward,
-        "binary_code": binary_code_reward,
-        "ioi_code": update_wrapper(
-            partial(ioi_code_reward, test_batch_size=script_args.code_eval_test_batch_size), ioi_code_reward
-        ),
-        "code_format": get_code_format_reward(language=script_args.code_language),
-        "tag_count": tag_count_reward,
-    }
-    reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
+def calculate_reward_unidiff(
+    oracle_patches: list[str], pred_patches: list[str]
+) -> tuple[float, dict]:
+    """
+    Compute the SWE-RL reward given two sets of unified diffs.
 
-    return reward_funcs
+    The return value is always within the range of [0, 1].
+
+    Args:
+        oracle_patches: A list of oracle diffs.
+        pred_patches: A list of predicted diffs.
+
+    Returns:
+        A float value representing the reward, and a dictionary containing some metadata.
+    """
+    # Calculate the reward based on the similarity between the predicted and the oracle patch
+    pred_patch_dict = dict[str, str]()
+    oracle_patch_dict = dict[str, str]()
+
+    for patch_text in oracle_patches:
+        oracle_patch_dict.update(get_filelevel_diff(patch_text))
+
+    for patch_text in pred_patches:
+        pred_patch_dict.update(get_filelevel_diff(patch_text))
+
+    similarities = compute_change_similarities(pred_patch_dict, oracle_patch_dict)
+    if len(similarities) == 0:
+        assert len(pred_patch_dict) == 0 and len(oracle_patch_dict) == 0
+        return 1.0, dict(similarities=[])
+    reward = sum(map(lambda x: x["similarity"], similarities)) / len(similarities)
+    return reward, dict(similarities=similarities)
